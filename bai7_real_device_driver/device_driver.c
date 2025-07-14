@@ -23,6 +23,7 @@ dev_t dev_num=0;
 static struct class *logan_class;
 static struct device *logan_device;
 static struct cdev device_cdev;
+static size_t data_len = 0;
 
 static int logan_open(struct inode *inode, struct file *file);
 static int logan_release(struct inode *inode, struct file *file);
@@ -39,103 +40,117 @@ static struct file_operations fops = {
 
 static int logan_open(struct inode *inode, struct file *file){
     pr_info("Hi, your driver is opened ^_^! \n");
-    kernel_buffer = kmalloc(BUFFER_SIZE, GFP_KERNEL);
+    
+    // Chỉ allocate memory nếu chưa có
     if(!kernel_buffer){
-        pr_err("Failed to allocate memory\n");
-        return -ENOMEM; // Ma loi chuan khi thieu bo nho ^^
-    }
-    else{
+        kernel_buffer = kmalloc(BUFFER_SIZE, GFP_KERNEL);
+        if(!kernel_buffer){
+            pr_err("Failed to allocate memory\n");
+            return -ENOMEM;
+        }
+        // Khởi tạo buffer với null terminator
+        memset(kernel_buffer, 0, BUFFER_SIZE);
         pr_info("Allocate the memory success!");
     }
     return 0;
 }
 
 static int logan_release(struct inode *inode, struct file *file){
-    if(kernel_buffer){
-        kfree(kernel_buffer);
-        kernel_buffer=NULL;
-    }
     pr_info("Bye, see you again v_v !!! \n");
     return 0;
 }
 
-//Muc dich cua ham write nay de lay du lieu tu user_space de ghi vao kernel_space (echo)
-
+// Mục đích của hàm write này để lấy dữ liệu từ user_space để ghi vào kernel_space (echo)
 static ssize_t logan_write(struct file *file, const char __user *buff, size_t len, loff_t *offset){
-    if(len > BUFFER_SIZE)
-        len = BUFFER_SIZE;
-    if(copy_from_user(kernel_buffer, buff, len) != 0){ //dich den, nguon, kich thuoc
-        pr_err("FAILED TO WRITE DATA \r\n");
-        return -EFAULT; // Loi
+    if(!kernel_buffer){
+        pr_err("Kernel buffer not allocated\n");
+        return -ENOMEM;
     }
-    pr_info("DATA WRITE: %s\n", kernel_buffer);
+    
+    if(len >= BUFFER_SIZE)  // >= để còn chỗ cho '\0'
+        len = BUFFER_SIZE - 1;
+
+    if(copy_from_user(kernel_buffer, buff, len) != 0){
+        pr_err("FAILED TO WRITE DATA \r\n");
+        return -EFAULT;
+    }
+
+    kernel_buffer[len] = '\0';  // Kết thúc chuỗi
+    data_len = len;
+    
+    pr_info("DATA WRITE (%zu bytes): %s\n", len, kernel_buffer);
     return len;
 }
 
 static ssize_t logan_read(struct file *file, char __user *buff, size_t len, loff_t *offset){
-    if(*offset >= BUFFER_SIZE){
+    if(!kernel_buffer){
+        pr_err("Kernel buffer not allocated\n");
+        return -ENOMEM;
+    }
+    
+    // Nếu đã đọc hết dữ liệu, trả về 0 (EOF)
+    if (*offset >= data_len)
         return 0;
-    }
-    if(len > BUFFER_SIZE - *offset){
-        len = (BUFFER_SIZE - *offset);
-    }
 
-    if (copy_to_user(buff, kernel_buffer + *offset, len) != 0) {
+    // Tính toán số bytes cần đọc
+    size_t bytes_to_read = data_len - *offset;
+    if(len < bytes_to_read)
+        bytes_to_read = len;
+
+    // Copy dữ liệu từ kernel space sang user space
+    if(copy_to_user(buff, kernel_buffer + *offset, bytes_to_read) != 0){
         pr_err("FAILED TO READ DATA \r\n");
         return -EFAULT;
     }
 
-    *offset += len;
-    pr_info("DATA READ (%zu bytes): %.*s\n", len, (int)len, kernel_buffer);
-    return len;
+    *offset += bytes_to_read;
+    pr_info("DATA READ (%zu bytes): %.*s\n", bytes_to_read, (int)bytes_to_read, kernel_buffer + (*offset - bytes_to_read));
+    return bytes_to_read;
 }
 
 int ret, a;
 
 static int __init device_driver_init(void){
     pr_info("Hi, Let's start to my driver. \n");
-    // Tao device voi major va minor 
+    
+    // Tạo device với major và minor 
     ret = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
-    // Check
-    if(ret<0){
+    if(ret < 0){
         pr_err("Failed to allocate character device region\n");
         return ret;
     }
-    // Neu tao duoc:
     pr_info("Device allocated with major_number: %d and minor_number: %d .\r\n", MAJOR(dev_num), MINOR(dev_num));
 
-    // Tao character device
+    // Tạo character device
     cdev_init(&device_cdev, &fops);
-    // Add
     a = cdev_add(&device_cdev, dev_num, 1);
 
-    if(a<0){
+    if(a < 0){
         pr_err("Fail to add device character v_v! \n");
-        cdev_del(&device_cdev);
-        unregister_chrdev_region(dev_num, 1); // If adding the character device fails, release the device number
+        unregister_chrdev_region(dev_num, 1);
         return a;
     }else{
         pr_info("Load device character successfull ^_^! \n");
     }
 
-    // Tao class va device 
+    // Tạo class và device 
     logan_class = class_create(THIS_MODULE, "Logan_Class");
-    // Check
     if(IS_ERR(logan_class)){
         pr_err("Failed to create your class! \n");
-        // Khong tao duoc thi phai xoa dev_num
         cdev_del(&device_cdev);
-        unregister_chrdev_region(dev_num, 1); // If adding the character device fails, release the device number
+        unregister_chrdev_region(dev_num, 1);
+        return PTR_ERR(logan_class);
     }else{
         pr_info("Your class is created successfull. \n");
     }
-    // Tao device
+    
+    // Tạo device
     logan_device = device_create(logan_class, NULL, dev_num, NULL, "Logan_Device");
-    //Check
     if(IS_ERR(logan_device)){
         pr_err("Failed to create your device! \n");
+        class_destroy(logan_class);
         cdev_del(&device_cdev);
-        class_destroy(logan_class); // Khi khong tao duoc device, can giai phong class
+        unregister_chrdev_region(dev_num, 1);
         return PTR_ERR(logan_device);
     }else{
         pr_info("Your device is created successfull. \n");
@@ -146,6 +161,13 @@ static int __init device_driver_init(void){
 
 static void __exit device_driver_exit(void){
     pr_info("======================EXIT=======================\n");
+    
+    // Giải phóng memory nếu có
+    if(kernel_buffer){
+        kfree(kernel_buffer);
+        kernel_buffer = NULL;
+    }
+    
     device_destroy(logan_class, dev_num);
     class_destroy(logan_class);
     cdev_del(&device_cdev);
